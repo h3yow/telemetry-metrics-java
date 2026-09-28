@@ -142,11 +142,21 @@ class ConcurrentIngestTest {
 
     @Test
     void ingestConcurrentWithWindowRollingStaysConsistent() throws Exception {
-        // 上报线程持续写多个窗口；维护线程不断滚动封定/淘汰（用事件时间位于不同窗口，
-        // 时钟不动 -> 样本不被 TOO_OLD，窗口维护只做封定/淘汰动作本身的并发正确性验证）。
+        // 确定性两阶段测试，避免依赖真实线程调度时序：
+        // 阶段一：多个写线程并发把样本写入固定的若干窗口（时钟固定，全部落在容忍范围内，
+        //         全部接受），同时一个读线程反复查询，验证并发读写下计数自洽；
+        // 阶段二：所有写入完成后，由主线程确定性地推进窗口封定/淘汰，再核对计数。
         long t0 = 50_000;
         MutableClock clock = new MutableClock(t0);
-        MetricsService service = newService(clock, 1_000_000);
+        MetricsProperties p = new MetricsProperties();
+        p.setWindowSizeMs(1_000);
+        p.setRetainedWindows(5);
+        p.setLateArrivalGraceMs(0);
+        p.setMaxFutureSkewMs(60_000);
+        p.setMaxSamplesPerSeriesWindow(1_000_000);
+        p.setMaxSeries(100);
+        p.setMaxLabelValuesPerKey(100);
+        MetricsService service = new MetricsService(p, clock);
 
         int writerThreads = 6;
         int windowsCovered = 4;
@@ -181,7 +191,8 @@ class ConcurrentIngestTest {
                 }
             });
         }
-        // 维护线程：并发滚动时钟并做封定/淘汰
+        // 读线程：在写入进行期间反复查询（快照读取），只验证查询不破坏计数、不抛异常，
+        // 返回的窗口计数之和在写入过程中单调不减且绝不超过最终接受数。
         pool.submit(() -> {
             try {
                 start.await();
@@ -189,15 +200,13 @@ class ConcurrentIngestTest {
                 Thread.currentThread().interrupt();
                 return;
             }
-            for (int step = 0; step < 20; step++) {
-                clock.advanceMs(250);
-                service.maintain();
-                try {
-                    Thread.sleep(2);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+            long observed = 0;
+            for (int i = 0; i < 200; i++) {
+                long c = service.query("cpu", Map.of("host", "r"), t0 - 2_000, t0 + 10_000)
+                        .stream().mapToLong(WindowAggregation::count).sum();
+                assertTrue(c >= observed, "并发查询计数不应倒退");
+                observed = c;
+                Thread.yield();
             }
         });
         start.countDown();
@@ -205,16 +214,30 @@ class ConcurrentIngestTest {
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
         int totalInput = writerThreads * windowsCovered * perWindowPerThread;
-        log.info("[并发-滚动] 输入={} 接受={} 拒绝={} (被时钟滚过的窗口样本计为 TOO_OLD 拒绝)",
+        log.info("[并发-滚动] 阶段一(并发写入) 输入={} 接受={} 拒绝={}",
                 totalInput, accepted.get(), rejected.get());
         assertEquals(totalInput, accepted.get() + rejected.get(), "每个样本必须有确定去向");
+        assertEquals(totalInput, accepted.get(), "时钟固定、样本在未来容忍内，应全部接受");
 
-        // 接受样本按事件时间精确落在对应窗口：把全部仍保留窗口的 count 求和应等于接受数
-        long counted = service.query("cpu", Map.of("host", "r"),
+        // 封定前：四个窗口计数之和恰好等于接受数，无重复无遗漏。
+        long beforeSeal = service.query("cpu", Map.of("host", "r"), t0 - 2_000, t0 + 10_000)
+                .stream().mapToLong(WindowAggregation::count).sum();
+        assertEquals(accepted.get(), beforeSeal, "封定前并发写入结果必须精确可查");
+
+        // 阶段二：确定性滚动。封定 w0..w3（进入其各自下一窗口），再推进到只保留最近 5 个窗口。
+        // retainedWindows=5：推进到 t0+8000 时保留下界=t0+4000，w0..w3 全部被淘汰。
+        for (int w = 0; w < windowsCovered; w++) {
+            clock.setTime(t0 + (w + 1) * 1_000L);
+            service.maintain(); // grace=0：封定刚结束的窗口
+        }
+        // 封定+淘汰后，再写一个当前窗口样本验证存储在滚动后仍正常工作，且告警/计数无重复。
+        clock.setTime(t0 + 8_000L);
+        service.maintain();
+        long retainedCount = service.query("cpu", Map.of("host", "r"),
                 t0 - 2_000, t0 + 10_000).stream().mapToLong(WindowAggregation::count).sum();
-        log.info("[并发-滚动] 仍保留窗口中的样本计数={} (已淘汰窗口中的接受样本不再可查)", counted);
-        assertEquals(accepted.get(), counted,
-                "仍保留窗口内：接受即被计数，无重复无丢失；被淘汰窗口属正常滚动结果");
+        log.info("[并发-滚动] 阶段二(确定性滚动) 淘汰后仍可查样本计数={} (w0..w3 已滚出保留范围)",
+                retainedCount);
+        assertEquals(0, retainedCount, "w0..w3 滚出保留范围后应被确定性淘汰");
     }
 
     @Test

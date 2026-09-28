@@ -92,6 +92,6 @@ final class SeriesWindow {
             return null;
         }
         return new WindowAggregation(name, java.util.Map.copyOf(labels), windowStart, windowSize,
-                count, sum, min, max, lastValue);
+                count, sum, min, max, lastValue, lastTimestamp);
     }
 }

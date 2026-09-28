@@ -94,4 +94,55 @@ class EndToEndIntegrationTest {
                         result.getResponse().getContentAsString()))
                 .andExpect(status().isBadRequest());
     }
+
+    @Test
+    void groupedQueryOverHttpMergesByLabelAndSignalsLimits() throws Exception {
+        long now = System.currentTimeMillis();
+        long windowStart = now - now % 10_000;
+
+        // 同一 host、不同 service 的两条序列 -> 按 host 分组合并。
+        List<Map<String, Object>> samples = List.of(
+                Map.of("name", "cpu", "value", 10.0, "timestamp", now - 100,
+                        "labels", Map.of("host", "a", "service", "x"), "sampleId", "g1"),
+                Map.of("name", "cpu", "value", 20.0, "timestamp", now - 50,
+                        "labels", Map.of("host", "a", "service", "y"), "sampleId", "g2"),
+                Map.of("name", "cpu", "value", 70.0, "timestamp", now - 50,
+                        "labels", Map.of("host", "b"), "sampleId", "g3"));
+        mockMvc.perform(post("/metrics/samples")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(samples)))
+                .andExpect(jsonPath("$.length()").value(3));
+
+        String gq = objectMapper.writeValueAsString(Map.of(
+                "name", "cpu",
+                "groupByKeys", List.of("host"),
+                "fromEpochMs", windowStart,
+                "toEpochMs", windowStart));
+        log.info("[E2E] POST /metrics/query-groups body={}", gq);
+        mockMvc.perform(post("/metrics/query-groups")
+                        .contentType(MediaType.APPLICATION_JSON).content(gq))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("OK"))
+                .andExpect(jsonPath("$.results.length()").value(2))
+                // 结果按分组标签字典序：host=a 在前，跨两条序列合并 sampleCount=2/seriesCount=2。
+                .andExpect(jsonPath("$.results[0].groupLabels.host").value("a"))
+                .andExpect(jsonPath("$.results[0].sampleCount").value(2))
+                .andExpect(jsonPath("$.results[0].seriesCount").value(2))
+                .andExpect(jsonPath("$.results[0].sum").value(30.0))
+                .andExpect(jsonPath("$.results[1].groupLabels.host").value("b"));
+
+        // 请求范围超过 maxQueryWindows 默认上限 -> 422 + 可区分状态，不静默截断。
+        String tooWide = objectMapper.writeValueAsString(Map.of(
+                "name", "cpu",
+                "groupByKeys", List.of("host"),
+                "fromEpochMs", windowStart - 10_000_000L,
+                "toEpochMs", windowStart));
+        mockMvc.perform(post("/metrics/query-groups")
+                        .contentType(MediaType.APPLICATION_JSON).content(tooWide))
+                .andExpect(result -> log.info("[E2E] 超宽分组查询响应: {}",
+                        result.getResponse().getContentAsString()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.status").value("TOO_MANY_WINDOWS"))
+                .andExpect(jsonPath("$.results.length()").value(0));
+    }
 }

@@ -4,6 +4,7 @@ import com.github.h3yow.telemetrymetricsjava.metrics.MetricsService;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertEvent;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertRule;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertStatusView;
+import com.github.h3yow.telemetrymetricsjava.metrics.model.GroupQueryResult;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.IngestResult;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.MetricSample;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.WindowAggregation;
@@ -43,6 +44,17 @@ public class MetricsController {
         return metricsService.query(request.name(),
                 request.labels() == null ? Map.of() : request.labels(),
                 request.fromEpochMs(), request.toEpochMs());
+    }
+
+    /** 按部分标签分组查询跨序列聚合。超限时 HTTP 422 + 可区分状态，不静默截断。 */
+    @PostMapping("/query-groups")
+    public ResponseEntity<GroupQueryResult> queryGroups(@RequestBody GroupQueryRequest request) {
+        GroupQueryResult result = metricsService.queryGroups(request.name(),
+                request.groupByKeys() == null ? List.of() : request.groupByKeys(),
+                request.fromEpochMs(), request.toEpochMs());
+        return result.isComplete()
+                ? ResponseEntity.ok(result)
+                : ResponseEntity.unprocessableEntity().body(result);
     }
 
     /** 注册告警规则（含滞回阈值）。 */

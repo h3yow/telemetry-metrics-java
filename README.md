@@ -106,6 +106,9 @@ windowStart = floorDiv(timestamp, windowSizeMs) * windowSizeMs
 标签值集合 ≤ #labelKey × maxLabelValuesPerKey
 幂等集合大小 ≤ 对应窗口样本数
 告警状态条目 ≤ 规则数 × 序列数
+分组状态条目 ≤ 分组规则数 × maxGroupCombinations（且受保留期淘汰约束）
+单次分组查询：窗口数 ≤ maxQueryWindows、组合数 ≤ maxGroupCombinations、
+组内序列数 ≤ maxSeriesPerGroup
 告警事件队列 ≤ 10_000（超出丢弃最旧并计数，见 droppedEventCount）
 ```
 
@@ -151,14 +154,90 @@ FIRING   -- observed <= recoverThreshold --> RESOLVED （产生一次 RESOLVED �
 
 ---
 
+## 3A. 按标签分组的跨序列汇总与分组告警
+
+在单序列能力之上新增一层“按部分标签分组”：调用方只指定关心的几个标签键，
+同一窗口内这些键取值相同的多条序列合并成一组，对“这一组的整体水位”查询与告警，
+而不是对每台机器单独告警。
+
+### 3A.1 分组查询 `queryGroups` / `POST /metrics/query-groups`
+
+入参 `name + groupByKeys + fromEpochMs + toEpochMs`，输出
+`GroupWindowAggregation` 列表，每行是“一个分组在一个窗口”的跨序列聚合：
+
+| 字段 | 含义 |
+| --- | --- |
+| `groupLabels` | **仅含分组键**投影出的标签子集（按 key 排序）；未参与分组的标签不会出现 |
+| `sampleCount` | 组内样本总数（跨序列求和） |
+| `seriesCount` | 贡献样本的序列数 |
+| `sum / min / max / average` | 跨序列合并的和、最小、最大、平均值 |
+| `lastValue` | 组内**按事件时间**的最后值（事件时间相同按序列键字典序取确定值） |
+
+分组语义要点：
+
+- **只按调用方指定的键拆组**：`groupByKeys=["host"]` 时，同 host 的
+  `service/instance` 等额外标签差异不会把一组拆成多组；`groupByKeys=[]`
+  表示把该指标全部序列合并成一个无分组标签的**总组**。
+- 分组键在某序列上缺失时按空串 `""` 取值，“无此标签”自成一组，不与任何实际值合并。
+- **只输出有样本的（分组，窗口）**，空分组不会凭空出现；空结果返回空列表。
+- **顺序确定可复现**：结果先按窗口起点升序，同一窗口内按分组标签
+  `(key,value)` 字典序升序；序列侧用按 `SeriesKey` 排序的 TreeMap 遍历，
+  因此相同输入（无论标签 Map 实现、传入键顺序、到达顺序如何）多次查询的
+  顺序与内容完全一致。
+
+### 3A.2 分组告警规则
+
+`AlertRule` 新增可选字段 `groupByKeys`（空列表 = 原有单序列模式，完全兼容）。
+非空时规则按这些键把封定窗口内、通过 `labelMatchers` 的序列分组，对每个分组的
+聚合结果（`AVG/SUM/MAX/MIN/COUNT/LAST`，其中 `COUNT` 为组内样本总数）独立做滞回判定。
+
+- **每个（规则 × 分组 × 窗口）只判定一次**：存储层在窗口越过“结束 + 迟到宽限”
+  封定线时，把该（指标，窗口）的**全部**序列快照整体、恰好一次交给分组判定器；
+  此后迟到样本会被 `TOO_OLD` 拒绝，不存在“先判一半再补齐”。
+- **没有样本的窗口不会被当成 0 值或正常值推进状态**：分组在某窗口缺席时，
+  该分组的滞回状态原样保留，不触发恢复。
+- **消失再出现**：明确保留期（`group-alert-retention-windows`）内分组消失又回来，
+  沿用原状态——状态没变不重复告警，回到 `RESOLVED` 后再次越线才重新触发；
+  超过保留期仍未出现的分组状态条目被静默淘汰（不补发合成 `RESOLVED`），
+  之后回来按全新组处理（可再次触发），从而保证状态表不随标签组合无限增长。
+- **可解释**：分组事件 `AlertEvent` 带 `grouped=true`、`groupLabels`、
+  `seriesCount`、`sampleCount` 与文字依据（分组、样本/序列数、观测值、阈值比较）；
+  `groupAlertStatuses()` 提供每个分组的当前状态。
+
+### 3A.3 容量边界与可区分反馈
+
+分组能力不静默丢样本、不把不同组合合并，任何超限都返回**可区分状态**：
+
+| 反馈（`GroupQueryStatus`） | 触发条件 | HTTP |
+| --- | --- | --- |
+| `OK` | 完整返回 | 200 |
+| `TOO_MANY_WINDOWS` | 请求窗口数超 `max-query-windows` | 422 |
+| `TOO_MANY_GROUP_COMBINATIONS` | 某窗口分组取值组合数超 `max-group-combinations` | 422 |
+| `TOO_MANY_SERIES_IN_GROUP` | 某分组合并的序列数超 `max-series-per-group` | 422 |
+
+分组告警路径超组合/组内序列上限时，该（规则，窗口）判定被跳过并计数，
+通过 `AlertEvaluator.groupEvaluationSkipCount()` 与 `lastGroupSkipDetail()` 可观测。
+分组状态条目数 ≤ `规则数 × 有界组合数`，且受保留期淘汰约束，
+**不会随运行时间或新标签组合不断增长**；分组查询只遍历有界的存活窗口，
+锁内取快照、锁外合并，查询延迟稳定不越跑越慢。
+
+### 3A.4 并发一致性
+
+分组遍历与聚合全部在存储的同一把 `ReentrantLock` 下取不可变快照后于锁外完成：
+并发上报、查询、窗口滚动/封定同时发生时，分组 `sampleCount` 与接受样本
+精确守恒（不重复计数、不漏样本），封定回调每窗口每组恰好一次。
+
+---
+
 ## 4. HTTP 接口（本地可选）
 
 | 方法 & 路径 | 作用 |
 | --- | --- |
 | `POST /metrics/samples` | 批量上报，返回每条样本的接受/拒绝结论 |
 | `POST /metrics/query` | 按指标名+标签+时间范围查各窗口聚合（时间自动对齐窗口） |
-| `POST /metrics/alerts/rules` | 注册告警规则（重复 ruleId 返回 400） |
-| `GET  /metrics/alerts/status` | 当前全部规则×序列状态 |
+| `POST /metrics/query-groups` | 按部分标签分组查跨序列聚合；超限返回 422 + 可区分状态 |
+| `POST /metrics/alerts/rules` | 注册告警规则（重复 ruleId 返回 400；`groupByKeys` 非空即分组规则） |
+| `GET  /metrics/alerts/status` | 当前全部规则×序列（及规则×分组）状态 |
 | `POST /metrics/alerts/events/drain` | 取走并清空状态翻转事件 |
 
 启动：
@@ -185,13 +264,17 @@ curl -s -X POST localhost:8080/metrics/samples -H 'Content-Type: application/jso
 | `metrics.max-label-values-per-key` | 2000 | 单标签 key 的值基数上限 |
 | `metrics.max-future-skew-ms` | 60000 | 允许的未来时间偏移 |
 | `metrics.late-arrival-grace-ms` | 5000 | 迟到宽限 / 告警封定延迟 |
+| `metrics.max-group-combinations` | 1000 | 分组查询/封定允许的标签取值组合数上限 |
+| `metrics.max-series-per-group` | 5000 | 单分组允许合并的序列数上限 |
+| `metrics.max-query-windows` | 1000 | 一次查询允许的窗口数上限 |
+| `metrics.group-alert-retention-windows` | 6 | 分组告警状态消失后保留窗口数，超期淘汰 |
 
 ---
 
 ## 6. 验证方法
 
 ```bash
-mvn test            # 全部 14 个测试，纯内存、无外部依赖，可重复运行
+mvn test            # 全部 26 个测试，纯内存、无外部依赖，可重复运行
 ```
 
 测试与对应需求：
@@ -201,8 +284,11 @@ mvn test            # 全部 14 个测试，纯内存、无外部依赖，可重
 | `WindowAggregationTest` | 按事件时间/标签聚合；各类拒绝原因可区分；窗口滚动淘汰与内存上界 |
 | `OutOfOrderSampleTest` | 乱序归入正确窗口；宽限内迟到计入一次；超宽限 TOO_OLD；`sampleId` 幂等；边界点唯一归窗；`lastValue` 按事件时间 |
 | `AlertEvaluationTest` | 滞回去抖、死区不触发/不提前恢复、恢复后重新触发、每窗口恰好一次事件 |
-| `ConcurrentIngestTest` | 8/16 线程并发上报无丢失无重复、容量不超卖、上报与窗口滚动并发一致、相同 `sampleId` 并发重传恰好一次 |
-| `EndToEndIntegrationTest` | 经 HTTP 的上报→查询→规则→状态全链路，以及 400 错误区分 |
+| `GroupAggregationQueryTest` | 按部分标签跨序列合并；全字段计算（含按事件时间 `lastValue`）；额外标签不拆组、缺键自成一组、无空分组；重复查询顺序内容一致；三类容量上界可区分反馈 |
+| `GroupAlertEvaluationTest` | 分组独立滞回与事件依据；缺窗口不被当 0/正常值、保留期内回来不重触发；恢复后重新触发；超保留期按新组处理且不补发 RESOLVED；同组同窗口只判定一次 |
+| `GroupedConcurrencyTest` | 并发上报+滚动下分组计数守恒、同组多序列不重复告警、重复查询结果一致与查询有界、超限可区分反馈 |
+| `ConcurrentIngestTest` | 多线程并发上报无丢失无重复、容量不超卖、确定性两阶段的上报与窗口滚动并发一致、相同 `sampleId` 并发重传恰好一次 |
+| `EndToEndIntegrationTest` | 经 HTTP 的上报→查询→分组查询→规则→状态全链路，400/422 错误区分 |
 
 所有单测日志均打印**输入样本**（值/事件时间/标签/ID）与**判定依据**（归入窗口、
 拒绝原因、聚合值、阈值比较），可用以下方式查看：

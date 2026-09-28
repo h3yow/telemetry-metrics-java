@@ -4,6 +4,7 @@ import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertEvent;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertEvaluator;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertRule;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertStatusView;
+import com.github.h3yow.telemetrymetricsjava.metrics.model.GroupQueryResult;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.IngestResult;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.MetricSample;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.RejectReason;
@@ -44,10 +45,20 @@ public class MetricsService {
                 properties.getMaxLabelValuesPerKey(),
                 properties.getMaxFutureSkewMs(),
                 properties.getLateArrivalGraceMs(),
+                properties.getMaxGroupCombinations(),
+                properties.getMaxSeriesPerGroup(),
+                properties.getMaxQueryWindows(),
                 clock);
-        this.alertEvaluator = new AlertEvaluator(List.of(), clock, 10_000);
+        this.alertEvaluator = new AlertEvaluator(List.of(), clock, 10_000,
+                properties.getWindowSizeMs(),
+                properties.getGroupAlertRetentionWindows(),
+                properties.getMaxGroupCombinations(),
+                properties.getMaxSeriesPerGroup());
         // 每个（序列，窗口）封定时恰好回调一次 -> 每窗口只判定一次。
         this.store.setSealedWindowListener(agg -> alertEvaluator.evaluate(agg, agg.windowStart()));
+        // 每个（指标，窗口）把该窗口全部序列快照恰好整体交出一次 -> 分组规则每窗口每组判定一次。
+        this.store.setGroupedWindowSealedListener((metricName, windowStart, size, aggs) ->
+                alertEvaluator.evaluateGroupedWindow(metricName, windowStart, aggs));
     }
 
     /** 上报单条样本，返回带明确拒绝原因的结果。 */
@@ -89,6 +100,26 @@ public class MetricsService {
         return store.query(name, labels, fromWindow, toWindow);
     }
 
+    /**
+     * 按部分标签分组查询：同一窗口内分组标签取值相同的多条序列合并为一组。
+     * 时间戳先对齐到窗口边界；{@code groupByKeys} 为空列表表示把该指标全部序列
+     * 合并成一个无分组标签的总组。超限时返回 {@link GroupQueryResult} 的可区分失败状态，
+     * 不静默截断。
+     */
+    public GroupQueryResult queryGroups(String name, List<String> groupByKeys,
+                                        long fromEpochMs, long toEpochMs) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("metric name must be present");
+        }
+        if (fromEpochMs > toEpochMs) {
+            throw new IllegalArgumentException("fromEpochMs must be <= toEpochMs");
+        }
+        long size = properties.getWindowSizeMs();
+        long fromWindow = Math.floorDiv(fromEpochMs, size) * size;
+        long toWindow = Math.floorDiv(toEpochMs, size) * size;
+        return store.queryGroups(name, groupByKeys, fromWindow, toWindow);
+    }
+
     /** 注册告警规则；重复 ruleId 将抛出 IllegalArgumentException。 */
     public AlertRule registerRule(AlertRule rule) {
         alertEvaluator.addRule(rule);
@@ -97,6 +128,11 @@ public class MetricsService {
 
     public List<AlertStatusView> alertStatuses() {
         return alertEvaluator.currentStatuses();
+    }
+
+    /** 分组规则在各分组上的当前状态（不消费事件）。 */
+    public List<AlertStatusView> groupAlertStatuses() {
+        return alertEvaluator.currentGroupStatuses();
     }
 
     /** 取走并清空累积的状态翻转事件。 */
