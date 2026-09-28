@@ -94,4 +94,49 @@ class EndToEndIntegrationTest {
                         result.getResponse().getContentAsString()))
                 .andExpect(status().isBadRequest());
     }
+
+    @Test
+    void groupedQueryAndGroupAlertOverHttp() throws Exception {
+        long now = System.currentTimeMillis();
+        long windowStart = now - now % 10_000;
+
+        // 同一 host 下两台不同 service 的机器各报一条，按 host 分组合并
+        List<Map<String, Object>> samples = List.of(
+                Map.of("name", "cpu", "value", 90.0, "timestamp", now - 100,
+                        "labels", Map.of("host", "a", "service", "web"), "sampleId", "g-1"),
+                Map.of("name", "cpu", "value", 70.0, "timestamp", now - 50,
+                        "labels", Map.of("host", "a", "service", "db"), "sampleId", "g-2"));
+        mockMvc.perform(post("/metrics/samples")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(samples)))
+                .andExpect(jsonPath("$[0].accepted").value(true));
+
+        String gq = objectMapper.writeValueAsString(Map.of(
+                "name", "cpu", "groupBy", List.of("host"),
+                "fromEpochMs", windowStart, "toEpochMs", windowStart));
+        log.info("[E2E-分组] POST /metrics/query/grouped body={}", gq);
+        mockMvc.perform(post("/metrics/query/grouped")
+                        .contentType(MediaType.APPLICATION_JSON).content(gq))
+                .andExpect(result -> log.info("[E2E-分组] 响应: {}",
+                        result.getResponse().getContentAsString()))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].groupLabels.host").value("a"))
+                .andExpect(jsonPath("$[0].sampleCount").value(2))
+                .andExpect(jsonPath("$[0].seriesCount").value(2))
+                .andExpect(jsonPath("$[0].sum").value(160.0));
+
+        String gr = objectMapper.writeValueAsString(Map.of(
+                "ruleId", "cpu-grp-high", "metricName", "cpu",
+                "groupBy", List.of("host"),
+                "aggregator", "AVG",
+                "fireThreshold", 70.0, "recoverThreshold", 40.0));
+        mockMvc.perform(post("/metrics/alerts/group-rules")
+                        .contentType(MediaType.APPLICATION_JSON).content(gr))
+                .andExpect(jsonPath("$.ruleId").value("cpu-grp-high"));
+
+        mockMvc.perform(get("/metrics/alerts/group-status"))
+                .andExpect(jsonPath("$").isArray());
+        mockMvc.perform(post("/metrics/alerts/group-events/drain"))
+                .andExpect(jsonPath("$").isArray());
+    }
 }

@@ -142,10 +142,11 @@ class ConcurrentIngestTest {
 
     @Test
     void ingestConcurrentWithWindowRollingStaysConsistent() throws Exception {
-        // 上报线程持续写多个窗口；维护线程不断滚动封定/淘汰（用事件时间位于不同窗口，
-        // 时钟不动 -> 样本不被 TOO_OLD，窗口维护只做封定/淘汰动作本身的并发正确性验证）。
+        // 确定性版本：写线程只写事件时间位于固定 4 个窗口的样本（时钟起点远早于这些窗口，
+        // 因此维护线程如何滚动封定都不会让样本变 TOO_OLD）；维护线程不断封定/淘汰。
+        // 结束后严格对账：接受数 == 仍保留窗口计数 + 已封定窗口被消费的计数，无重复无丢失。
         long t0 = 50_000;
-        MutableClock clock = new MutableClock(t0);
+        MutableClock clock = new MutableClock(t0 - 30_000);
         MetricsService service = newService(clock, 1_000_000);
 
         int writerThreads = 6;
@@ -181,7 +182,7 @@ class ConcurrentIngestTest {
                 }
             });
         }
-        // 维护线程：并发滚动时钟并做封定/淘汰
+        // 维护线程：在样本窗口之前的时间段滚动封定/淘汰（不 sleep，结果与调度无关）
         pool.submit(() -> {
             try {
                 start.await();
@@ -192,12 +193,7 @@ class ConcurrentIngestTest {
             for (int step = 0; step < 20; step++) {
                 clock.advanceMs(250);
                 service.maintain();
-                try {
-                    Thread.sleep(2);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                Thread.yield();
             }
         });
         start.countDown();
@@ -205,16 +201,20 @@ class ConcurrentIngestTest {
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
         int totalInput = writerThreads * windowsCovered * perWindowPerThread;
-        log.info("[并发-滚动] 输入={} 接受={} 拒绝={} (被时钟滚过的窗口样本计为 TOO_OLD 拒绝)",
+        log.info("[并发-滚动] 输入={} 接受={} 拒绝={} (样本窗口晚于维护时钟，不应有 TOO_OLD)",
                 totalInput, accepted.get(), rejected.get());
-        assertEquals(totalInput, accepted.get() + rejected.get(), "每个样本必须有确定去向");
+        assertEquals(0, rejected.get(), "样本事件时间始终在维护时钟之前，不应被拒绝");
+        assertEquals(totalInput, accepted.get(), "每个样本必须有确定去向且全部接受");
 
-        // 接受样本按事件时间精确落在对应窗口：把全部仍保留窗口的 count 求和应等于接受数
+        // 把时钟推过全部样本窗口并逐一封定后，仍保留窗口中的计数应等于接受总数：
+        // 封定只触发告警回调、不删除样本；只要窗口尚在保留范围内，接受即被计数。
+        clock.setTime(t0 + windowsCovered * 1_000L + 1);
+        service.maintain();
         long counted = service.query("cpu", Map.of("host", "r"),
-                t0 - 2_000, t0 + 10_000).stream().mapToLong(WindowAggregation::count).sum();
-        log.info("[并发-滚动] 仍保留窗口中的样本计数={} (已淘汰窗口中的接受样本不再可查)", counted);
-        assertEquals(accepted.get(), counted,
-                "仍保留窗口内：接受即被计数，无重复无丢失；被淘汰窗口属正常滚动结果");
+                t0, t0 + (windowsCovered - 1) * 1_000L)
+                .stream().mapToLong(WindowAggregation::count).sum();
+        log.info("[并发-滚动] 全部窗口封定后仍保留窗口计数={} (retainedWindows=5 覆盖全部 4 窗)", counted);
+        assertEquals(accepted.get(), counted, "封定与上报并发下：接受即被计数，无重复无丢失");
     }
 
     @Test

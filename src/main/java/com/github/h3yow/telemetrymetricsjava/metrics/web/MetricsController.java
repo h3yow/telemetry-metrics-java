@@ -4,6 +4,11 @@ import com.github.h3yow.telemetrymetricsjava.metrics.MetricsService;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertEvent;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertRule;
 import com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertStatusView;
+import com.github.h3yow.telemetrymetricsjava.metrics.alert.GroupAlertEvent;
+import com.github.h3yow.telemetrymetricsjava.metrics.alert.GroupAlertRule;
+import com.github.h3yow.telemetrymetricsjava.metrics.alert.GroupAlertStatusView;
+import com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitException;
+import com.github.h3yow.telemetrymetricsjava.metrics.model.GroupWindowAggregation;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.IngestResult;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.MetricSample;
 import com.github.h3yow.telemetrymetricsjava.metrics.model.WindowAggregation;
@@ -45,10 +50,36 @@ public class MetricsController {
                 request.fromEpochMs(), request.toEpochMs());
     }
 
+    /** 按部分标签分组查询跨序列聚合（groupBy 为空表示整指标一个组）。 */
+    @PostMapping("/query/grouped")
+    public List<GroupWindowAggregation> queryGrouped(@RequestBody GroupQueryRequest request) {
+        return metricsService.queryGrouped(request.name(),
+                request.groupBy() == null ? List.of() : request.groupBy(),
+                request.fromEpochMs(), request.toEpochMs());
+    }
+
     /** 注册告警规则（含滞回阈值）。 */
     @PostMapping("/alerts/rules")
     public AlertRule registerRule(@RequestBody AlertRule rule) {
         return metricsService.registerRule(rule);
+    }
+
+    /** 注册分组告警规则（按 groupBy 标签键分组，每组独立滞回判定）。 */
+    @PostMapping("/alerts/group-rules")
+    public GroupAlertRule registerGroupRule(@RequestBody GroupAlertRule rule) {
+        return metricsService.registerGroupRule(rule);
+    }
+
+    /** 查看全部分组规则在各分组上的当前状态（不消费事件）。 */
+    @GetMapping("/alerts/group-status")
+    public List<GroupAlertStatusView> groupAlertStatus() {
+        return metricsService.groupAlertStatuses();
+    }
+
+    /** 取走并清空累积的分组告警翻转事件。 */
+    @PostMapping("/alerts/group-events/drain")
+    public List<GroupAlertEvent> drainGroupEvents() {
+        return metricsService.drainGroupAlertEvents();
     }
 
     /** 查看全部规则在各序列上的当前状态（不消费事件）。 */
@@ -66,5 +97,15 @@ public class MetricsController {
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> handleBadRequest(IllegalArgumentException ex) {
         return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
+    }
+
+    /** 分组容量越界：返回 400，并带可区分的 reason / limit / actual，绝不静默截断。 */
+    @ExceptionHandler(GroupLimitException.class)
+    public ResponseEntity<Map<String, Object>> handleGroupLimit(GroupLimitException ex) {
+        return ResponseEntity.badRequest().body(Map.of(
+                "error", ex.getMessage() == null ? "group limit exceeded" : ex.getMessage(),
+                "reason", ex.reason().name(),
+                "limit", ex.limit(),
+                "actual", ex.actual()));
     }
 }

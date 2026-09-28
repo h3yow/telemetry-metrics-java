@@ -108,9 +108,10 @@ public class MetricWindowStore {
         long windowStart = floorWindowStart(ts);
 
         lock.lock();
+        NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
         try {
             // 维护先行：保证存活窗口集合始终是有界的。
-            maintainWindowsLocked(now);
+            maintainWindowsLocked(now, sealedBatches);
 
             long cutoff = now - lateArrivalGraceMs;
             if (ts < cutoff) {
@@ -173,6 +174,7 @@ public class MetricWindowStore {
                             + "), count=" + w.count());
         } finally {
             lock.unlock();
+            dispatchBatches(sealedBatches);
         }
     }
 
@@ -181,20 +183,32 @@ public class MetricWindowStore {
      * 可由定时任务或测试显式触发；ingest 路径也会顺带执行。
      */
     public void maintain() {
+        NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
         lock.lock();
         try {
-            maintainWindowsLocked(clock.millis());
+            maintainWindowsLocked(clock.millis(), sealedBatches);
         } finally {
             lock.unlock();
+            dispatchBatches(sealedBatches);
         }
     }
 
-    private void maintainWindowsLocked(long now) {
+    /** 批量封定回调在锁外触发（聚合计算可能较重），但“每窗口一次”的保证在锁内已确立。 */
+    private void dispatchBatches(NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
+        for (Map.Entry<Long, List<WindowAggregation>> e : sealedBatches.entrySet()) {
+            sealedWindowListener.onWindowBatchSealed(e.getKey(), e.getValue());
+        }
+    }
+
+    private void maintainWindowsLocked(long now,
+                                       NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
         // 窗口 [s, s+size) 封定条件：s + size + grace <= now，故封定上界为
         // floor((now - grace - size) / size) * size。grace=0 时恰好在下一个窗口开始时封定。
         long sealHorizon = floorWindowStart(now - lateArrivalGraceMs - windowSizeMs);
         long oldestAllowed = floorWindowStart(now) - (long) (retainedWindows - 1) * windowSizeMs;
 
+        // 本趟新封定的快照按 windowStart 收集；同一窗口来自所有序列的快照组成一个
+        // 稳定有序批次（锁外按序列键排序），交给分组告警做跨序列聚合。
         Iterator<Map.Entry<SeriesKey, TreeMap<Long, SeriesWindow>>> it = series.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<SeriesKey, TreeMap<Long, SeriesWindow>> entry = it.next();
@@ -206,8 +220,10 @@ public class MetricWindowStore {
                     w.markSealed();
                     WindowAggregation agg = w.snapshot();
                     if (agg != null) {
-                        // 监听器只读取快照、不重入存储；回调在锁内保证“每窗口恰好一次”。
+                        // 单序列回调仍在锁内触发（只读取快照、不重入存储）。
                         sealedWindowListener.onWindowSealed(agg);
+                        sealedBatches.computeIfAbsent(agg.windowStart(), k -> new ArrayList<>())
+                                .add(agg);
                     }
                 }
             }
@@ -217,6 +233,12 @@ public class MetricWindowStore {
             if (windows.isEmpty()) {
                 it.remove();
             }
+        }
+
+        // 按序列键对每个批次排序，保证分组聚合输入顺序确定、结果可复现。
+        for (List<WindowAggregation> batch : sealedBatches.values()) {
+            batch.sort(java.util.Comparator.comparing(
+                    a -> SeriesKey.of(a.name(), a.labels()).render()));
         }
     }
 
@@ -251,9 +273,77 @@ public class MetricWindowStore {
         return out;
     }
 
-    /** 当前处理时间对应的窗口起点。 */
-    public long currentWindowStart() {
+    /**
+     * 分组查询：在 [fromWindowStart, toWindowStart] 各窗口内，把同一指标的多条序列按
+     * groupBy 键取值合并成组。
+     *
+     * <p>锁内只做取不可变快照（按窗口收集、按序列键排序），锁外用
+     * {@link com.github.h3yow.telemetrymetricsjava.metrics.group.GroupAggregationBuilder}
+     * 做纯函数合并。四类容量越界（窗口数 / 组合数 / 组内序列数 / 返回行数）分别抛出
+     * 可区分的 {@link com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitException}，
+     * 不静默截断、不合并不同组合。</p>
+     */
+    public List<com.github.h3yow.telemetrymetricsjava.metrics.model.GroupWindowAggregation>
+            queryGrouped(String name, List<String> groupBy,
+                         long fromWindowStart, long toWindowStart,
+                         int maxCombinations, int maxSeriesPerGroup,
+                         int maxResultRows, int maxQueryWindows) {
+        long requestedWindows = (toWindowStart - fromWindowStart) / windowSizeMs + 1;
+        if (requestedWindows > maxQueryWindows) {
+            throw new com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitException(
+                    com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitReason
+                            .TOO_MANY_QUERY_WINDOWS,
+                    maxQueryWindows, requestedWindows,
+                    "grouped query spans " + requestedWindows + " windows, exceeds maxQueryWindows="
+                            + maxQueryWindows);
+        }
+
+        // windowStart -> 该窗口内命中指标的各序列快照（锁内收集，锁外合并）。
+        TreeMap<Long, List<WindowAggregation>> perWindow = new TreeMap<>();
         lock.lock();
+        try {
+            for (Map.Entry<SeriesKey, TreeMap<Long, SeriesWindow>> entry : series.entrySet()) {
+                if (!entry.getKey().name().equals(name)) {
+                    continue;
+                }
+                NavigableMap<Long, SeriesWindow> range =
+                        entry.getValue().subMap(fromWindowStart, true, toWindowStart, true);
+                for (SeriesWindow w : range.values()) {
+                    WindowAggregation agg = w.snapshot();
+                    if (agg != null) {
+                        perWindow.computeIfAbsent(agg.windowStart(), k -> new ArrayList<>()).add(agg);
+                    }
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        List<com.github.h3yow.telemetrymetricsjava.metrics.model.GroupWindowAggregation> out =
+                new ArrayList<>();
+        for (Map.Entry<Long, List<WindowAggregation>> e : perWindow.entrySet()) {
+            // 排序保证 lastValue 时间戳并列时取值确定，且分组结果完全可复现。
+            List<WindowAggregation> snapshots = e.getValue();
+            snapshots.sort(java.util.Comparator.comparing(
+                    a -> SeriesKey.of(a.name(), a.labels()).render()));
+            out.addAll(com.github.h3yow.telemetrymetricsjava.metrics.group.GroupAggregationBuilder
+                    .buildForWindow(name, groupBy, e.getKey(), windowSizeMs, snapshots,
+                            maxCombinations, maxSeriesPerGroup));
+        }
+
+        if (out.size() > maxResultRows) {
+            throw new com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitException(
+                    com.github.h3yow.telemetrymetricsjava.metrics.model.GroupLimitReason
+                            .TOO_MANY_RESULT_ROWS,
+                    maxResultRows, out.size(),
+                    "grouped query returns " + out.size() + " rows, exceeds maxGroupedQueryRows="
+                            + maxResultRows);
+        }
+        return out;
+    }
+
+    /** 当前处理时间对应的窗口起点。 */
+    public long currentWindowStart() {        lock.lock();
         try {
             return floorWindowStart(clock.millis());
         } finally {
