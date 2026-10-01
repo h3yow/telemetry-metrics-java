@@ -36,13 +36,18 @@ class EndToEndIntegrationTest {
 
     @Test
     void ingestQueryAndAlertOverHttp() throws Exception {
+        // 取当前窗口中点作为样本时间，避免测试在读时钟与真正入库之间跨越 10s 窗口边界
+        // 导致 windowStart 断言抖动（该断言本意是校验“按事件时间归窗”，与边界竞争无关）。
         long now = System.currentTimeMillis();
-        long windowStart = now - now % 10_000;
+        long aligned = now - Math.floorMod(now, 10_000);
+        long ts1 = aligned + 5_000;
+        long ts2 = aligned + 5_100;
+        long windowStart = aligned;
 
         List<Map<String, Object>> samples = List.of(
-                Map.of("name", "req.latency", "value", 120.0, "timestamp", now - 100,
+                Map.of("name", "req.latency", "value", 120.0, "timestamp", ts1,
                         "labels", Map.of("api", "/login"), "sampleId", "e2e-1"),
-                Map.of("name", "req.latency", "value", 140.0, "timestamp", now - 50,
+                Map.of("name", "req.latency", "value", 140.0, "timestamp", ts2,
                         "labels", Map.of("api", "/login"), "sampleId", "e2e-2"),
                 Map.of("name", "req.latency", "value", -1.0, "timestamp", 0L,
                         "labels", Map.of("api", "/login"), "sampleId", "e2e-bad"));

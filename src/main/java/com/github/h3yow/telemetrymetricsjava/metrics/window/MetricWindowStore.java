@@ -28,6 +28,14 @@ import java.util.concurrent.locks.ReentrantLock;
  * 重复计数与样本丢失；查询在同一把锁下取不可变快照，随后锁外组装结果，
  * 查询延迟只与命中的窗口数（有界）有关。</p>
  *
+ * <p><b>封定批次的有序、恰好一次投递</b>：封定快照在存储锁内收集进一个按窗口起点
+ * 排序的共享待投队列，锁释放后由一把独立的<b>投递锁</b>串行化回调——拿到投递锁的
+ * 线程会把队列中<b>所有</b>待投窗口（含其它并发线程刚封定并入队的窗口）按窗口起点
+ * 升序一次性排空调走。因此即便多个线程并发封定（较晚窗口先完成存储锁临界区），
+ * 分组告警侧看到的批次顺序也严格按窗口起点升序，且每个窗口恰好一次。此外，封定
+ * 水位向前推进时，没有任何样本的“空窗口”也会以空批次补位投递，保证窗口序列对
+ * 消费方是无空洞、无重复、单调递增的，保留期过期判定不依赖“恰好有数据的窗口”。</p>
+ *
  * <p><b>内存上界</b>：任一时刻存活窗口数至多为
  * {@code retainedWindows + futureToleranceWindows}（时间在走，维护会持续淘汰）；
  * 序列数 ≤ maxSeries；单序列单窗口样本数 ≤ maxSamplesPerSeriesWindow；
@@ -53,6 +61,21 @@ public class MetricWindowStore {
     private final Map<String, java.util.Set<String>> labelValues = new HashMap<>();
 
     private SealedWindowListener sealedWindowListener = aggregation -> { };
+
+    /**
+     * 已封定、待批量回调的窗口批次（windowStart -> 该窗口全部有样本序列的快照）。
+     * 只在 {@link #lock} 内写入/合并；空窗口以空 List 补位。
+     */
+    private final TreeMap<Long, List<WindowAggregation>> pendingBatches = new TreeMap<>();
+
+    /** 已补位投递到的最大窗口起点；下一个应投递的窗口起点 = 它 + windowSizeMs。 */
+    private long lastTickedWindow = Long.MIN_VALUE;
+
+    /**
+     * 独立于 {@link #lock} 的投递锁：保证批量回调在任何并发下都<b>串行且升序</b>。
+     * 绝不在持有 {@link #lock} 时获取它（回调不重入存储，避免锁序风险）。
+     */
+    private final ReentrantLock dispatchLock = new ReentrantLock();
 
     public MetricWindowStore(long windowSizeMs, int retainedWindows, int maxSamplesPerSeriesWindow,
                              int maxSeries, int maxLabelValuesPerKey, long maxFutureSkewMs,
@@ -108,10 +131,9 @@ public class MetricWindowStore {
         long windowStart = floorWindowStart(ts);
 
         lock.lock();
-        NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
         try {
             // 维护先行：保证存活窗口集合始终是有界的。
-            maintainWindowsLocked(now, sealedBatches);
+            maintainWindowsLocked(now);
 
             long cutoff = now - lateArrivalGraceMs;
             if (ts < cutoff) {
@@ -174,7 +196,7 @@ public class MetricWindowStore {
                             + "), count=" + w.count());
         } finally {
             lock.unlock();
-            dispatchBatches(sealedBatches);
+            dispatchPendingBatches();
         }
     }
 
@@ -183,32 +205,51 @@ public class MetricWindowStore {
      * 可由定时任务或测试显式触发；ingest 路径也会顺带执行。
      */
     public void maintain() {
-        NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
         lock.lock();
         try {
-            maintainWindowsLocked(clock.millis(), sealedBatches);
+            maintainWindowsLocked(clock.millis());
         } finally {
             lock.unlock();
-            dispatchBatches(sealedBatches);
+            dispatchPendingBatches();
         }
     }
 
-    /** 批量封定回调在锁外触发（聚合计算可能较重），但“每窗口一次”的保证在锁内已确立。 */
-    private void dispatchBatches(NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
-        for (Map.Entry<Long, List<WindowAggregation>> e : sealedBatches.entrySet()) {
-            sealedWindowListener.onWindowBatchSealed(e.getKey(), e.getValue());
+    /**
+     * 串行、升序、恰好一次地投递全部待投封定批次。先抢存储锁把本线程新封定的窗口并入
+     * 共享队列，再抢投递锁；抢到投递锁后重新在存储锁内合并一次（收编等待期间其它线程
+     * 新封定的窗口），随后锁外按窗口起点升序把队列排空调走。
+     */
+    private void dispatchPendingBatches() {
+        dispatchLock.lock();
+        try {
+            NavigableMap<Long, List<WindowAggregation>> ready = new TreeMap<>();
+            lock.lock();
+            try {
+                ready.putAll(pendingBatches);
+                pendingBatches.clear();
+            } finally {
+                lock.unlock();
+            }
+            // ready 为升序 TreeMap：窗口处理顺序与各线程封定完成的先后无关。
+            for (Map.Entry<Long, List<WindowAggregation>> e : ready.entrySet()) {
+                sealedWindowListener.onWindowBatchSealed(e.getKey(), e.getValue());
+            }
+        } finally {
+            dispatchLock.unlock();
         }
     }
 
-    private void maintainWindowsLocked(long now,
-                                       NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
+    private void maintainWindowsLocked(long now) {
         // 窗口 [s, s+size) 封定条件：s + size + grace <= now，故封定上界为
         // floor((now - grace - size) / size) * size。grace=0 时恰好在下一个窗口开始时封定。
         long sealHorizon = floorWindowStart(now - lateArrivalGraceMs - windowSizeMs);
         long oldestAllowed = floorWindowStart(now) - (long) (retainedWindows - 1) * windowSizeMs;
 
-        // 本趟新封定的快照按 windowStart 收集；同一窗口来自所有序列的快照组成一个
-        // 稳定有序批次（锁外按序列键排序），交给分组告警做跨序列聚合。
+        // 本趟第一个新封定窗口的起点（用于从上次投递水位连续补位空窗口）。
+        long firstSealedThisRun = Long.MAX_VALUE;
+
+        // 本趟新封定的快照按 windowStart 合并进共享待投队列；同一窗口来自所有序列的快照
+        // 组成一个稳定有序批次（按序列键排序），交给分组告警做跨序列聚合。
         Iterator<Map.Entry<SeriesKey, TreeMap<Long, SeriesWindow>>> it = series.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<SeriesKey, TreeMap<Long, SeriesWindow>> entry = it.next();
@@ -222,8 +263,12 @@ public class MetricWindowStore {
                     if (agg != null) {
                         // 单序列回调仍在锁内触发（只读取快照、不重入存储）。
                         sealedWindowListener.onWindowSealed(agg);
-                        sealedBatches.computeIfAbsent(agg.windowStart(), k -> new ArrayList<>())
-                                .add(agg);
+                        List<WindowAggregation> batch =
+                                pendingBatches.computeIfAbsent(agg.windowStart(), k -> new ArrayList<>());
+                        batch.add(agg);
+                        if (agg.windowStart() < firstSealedThisRun) {
+                            firstSealedThisRun = agg.windowStart();
+                        }
                     }
                 }
             }
@@ -235,8 +280,29 @@ public class MetricWindowStore {
             }
         }
 
-        // 按序列键对每个批次排序，保证分组聚合输入顺序确定、结果可复现。
-        for (List<WindowAggregation> batch : sealedBatches.values()) {
+        // 从上次投递水位的下一窗口开始，一直补到本趟封定水位：缺失窗口以空批次补位，
+        // 保证消费方看到的窗口序列连续无空洞——即使本趟在更晚窗口才封定到新数据，中间
+        // 的空窗口也不会被略过。缺样本窗口不是 0 值，对分组判定仅表示“这一拍没有该组
+        // 数据”（不推进状态、不过期），但它让消费方的有序处理不必永久等待空洞。
+        // 首次有封定数据时从本趟最早数据窗口起步（更早窗口无数据也无状态，无需补位）。
+        long fillFrom = lastTickedWindow == Long.MIN_VALUE
+                ? firstSealedThisRun
+                : lastTickedWindow + windowSizeMs;
+        for (long s = fillFrom; s <= sealHorizon; s += windowSizeMs) {
+            // 已存在（本趟封定的真实数据批次）不会被空批次覆盖。
+            pendingBatches.computeIfAbsent(s, k -> List.of());
+        }
+        if (fillFrom <= sealHorizon && sealHorizon > lastTickedWindow) {
+            // 本趟保证 sealHorizon 键已入队（真实数据或空补位），水位推进到它。
+            lastTickedWindow = sealHorizon;
+        }
+
+        // 按序列键对每个批次排序，保证分组聚合输入顺序确定、结果可复现。空批次为不可变
+        // 空 List，无需排序。
+        for (List<WindowAggregation> batch : pendingBatches.values()) {
+            if (batch.isEmpty()) {
+                continue;
+            }
             batch.sort(java.util.Comparator.comparing(
                     a -> SeriesKey.of(a.name(), a.labels()).render()));
         }
