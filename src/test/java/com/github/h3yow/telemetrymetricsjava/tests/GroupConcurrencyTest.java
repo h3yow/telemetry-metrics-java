@@ -38,10 +38,14 @@ class GroupConcurrencyTest {
     private static final Logger log = LoggerFactory.getLogger(GroupConcurrencyTest.class);
 
     private static MetricsService newService(MutableClock clock) {
+        return newService(clock, 0);
+    }
+
+    private static MetricsService newService(MutableClock clock, long graceMs) {
         MetricsProperties p = new MetricsProperties();
         p.setWindowSizeMs(1_000);
         p.setRetainedWindows(6);
-        p.setLateArrivalGraceMs(0);
+        p.setLateArrivalGraceMs(graceMs);
         p.setMaxFutureSkewMs(60_000);
         p.setMaxSamplesPerSeriesWindow(1_000_000);
         p.setMaxGroupCombinations(50);
@@ -204,6 +208,143 @@ class GroupConcurrencyTest {
             service.maintain();
         }
         assertTrue(service.drainGroupAlertEvents().isEmpty(), "窗口滚动重复 tick 不得重复判定");
+    }
+
+    /**
+     * 强断言并发滚动：多个 host 在多个窗口内的水位按“触发→死区→恢复→重新触发”编排，
+     * 写线程与维护线程激烈交错。无论封定批次以什么线程调度顺序到达判定器，
+     * 每个（分组×窗口）都必须恰好判定一次：最终翻转事件集合与顺序参考实现完全一致
+     * （不漏判、不重复判），且事件按窗口升序到达。
+     */
+    @Test
+    void concurrentRollingNeverSkipsNorDuplicatesWindowAcrossRepeatedRuns() throws Exception {
+        // 期望的水位编排（每窗口每组一个样本，MAX 判定，fire=80 / recover=50）
+        double[] aValues = {90, 95, 95, 40, 45, 90}; // 触发 w0；死区 w1/w2；恢复 w3；死区 w4；重触发 w5
+        double[] bValues = {10, 10, 90, 90, 90, 10}; // 触发 w2；w3/w4 仍 FIRING；恢复 w5
+        final double[] groupA = aValues;
+        final double[] groupB = bValues;
+        // 样本落在窗口 0..5；期望翻转（绝对窗口起点）
+        java.util.List<String> expected = java.util.List.of(
+                (0 * 1_000L) + "#host=a#FIRING",
+                (2 * 1_000L) + "#host=b#FIRING",
+                (3 * 1_000L) + "#host=a#RESOLVED",
+                (5 * 1_000L) + "#host=a#FIRING",
+                (5 * 1_000L) + "#host=b#RESOLVED");
+
+        int runs = 30;
+        for (int run = 0; run < runs; run++) {
+            final int runId = run;
+            long t0 = 60_000L + run * 100_000L;
+            MutableClock clock = new MutableClock(t0);
+            // 30s 迟到宽限：窗口只在其结束+宽限后封定，保证并发上报期间样本不被判 TOO_OLD；
+            // 阶段二时钟一次性推到全部窗口之后再驱动封定。
+            MetricsService service = newService(clock, 30_000);
+            service.registerGroupRule(new GroupAlertRule("grp-exact", "cpu", List.of("host"),
+                    com.github.h3yow.telemetrymetricsjava.metrics.alert.AlertRule.Aggregator.MAX,
+                    80.0, 50.0));
+            AtomicInteger accepted = new AtomicInteger();
+            AtomicInteger rejected = new AtomicInteger();
+
+            // 阶段一：6 个写线程在固定时钟下并发上报全部 12 个样本（ingest 路径仍会并发
+            // 触发维护），不会有窗口越过“结束+宽限”的封定点。
+            clock.setTime(t0 + 3_000L);
+            List<int[]> tasks = new ArrayList<>();
+            for (int w = 0; w < 6; w++) {
+                tasks.add(new int[]{0, w});
+                tasks.add(new int[]{1, w});
+            }
+            java.util.Collections.shuffle(tasks, new java.util.Random(run));
+            int writerThreads = 6;
+            ExecutorService writers = Executors.newFixedThreadPool(writerThreads);
+            CountDownLatch writeStart = new CountDownLatch(1);
+            int perWriter = tasks.size() / writerThreads;
+            for (int t = 0; t < writerThreads; t++) {
+                final List<int[]> mine = tasks.subList(t * perWriter,
+                        t == writerThreads - 1 ? tasks.size() : (t + 1) * perWriter);
+                writers.submit(() -> {
+                    try {
+                        writeStart.await();
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    for (int[] tw : mine) {
+                        String host = tw[0] == 0 ? "a" : "b";
+                        double value = tw[0] == 0 ? groupA[tw[1]] : groupB[tw[1]];
+                        IngestResult r = service.ingest(new MetricSample("cpu", value,
+                                t0 + tw[1] * 1_000L + 500, Map.of("host", host),
+                                "run" + runId + "-" + host + "-w" + tw[1]));
+                        if (r.accepted()) {
+                            accepted.incrementAndGet();
+                        } else {
+                            rejected.incrementAndGet();
+                        }
+                    }
+                });
+            }
+            writeStart.countDown();
+            writers.shutdown();
+            assertTrue(writers.awaitTermination(30, TimeUnit.SECONDS));
+            assertEquals(12, accepted.get(), () -> "全部样本应被接受，run=" + runId
+                    + " rejected=" + rejected.get());
+
+            // 阶段二：两个维护线程并发把时钟从 t0+3s 小步推过全部窗口的封定点
+            // （最后窗口 w5 结束 t0+6s + 宽限 30s = t0+36s），激烈竞争封定临界区、
+            // 投递闸门与判定器锁。事件只能在这一阶段产生。
+            ExecutorService rollers = Executors.newFixedThreadPool(2);
+            CountDownLatch rollStart = new CountDownLatch(1);
+            for (int rt = 0; rt < 2; rt++) {
+                rollers.submit(() -> {
+                    try {
+                        rollStart.await();
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    for (int step = 0; step < 68; step++) {
+                        clock.advanceMs(500);
+                        service.maintain();
+                        Thread.yield();
+                    }
+                });
+            }
+            rollStart.countDown();
+            rollers.shutdown();
+            assertTrue(rollers.awaitTermination(30, TimeUnit.SECONDS));
+
+            assertEquals(12, accepted.get() + rejected.get(), "每个样本必须有唯一确定去向");
+            assertEquals(12, accepted.get(), () -> "不应有拒绝，run=" + runId);
+
+            // 维护线程最终时钟约为 t0+37s（已越过 w5 封定点 t0+36s）；补一次维护兜底
+            if (clock.millis() < t0 + 37_000L) {
+                clock.setTime(t0 + 37_000L);
+            }
+            service.maintain();
+
+            List<GroupAlertEvent> events = service.drainGroupAlertEvents();
+            List<String> actual = events.stream()
+                    .filter(e -> e.ruleId().equals("grp-exact"))
+                    .map(e -> (e.windowStart() - t0) + "#" + e.groupKey() + "#" + e.state())
+                    .toList();
+
+            // 1) 事件窗口必须单调不减（按事件时间顺序产出，绝不被乱序投递打乱）
+            long prevWindow = Long.MIN_VALUE;
+            for (GroupAlertEvent e : events) {
+                assertTrue(e.windowStart() >= prevWindow,
+                        "事件必须按窗口升序产出，run=" + runId + " events=" + actual);
+                prevWindow = e.windowStart();
+            }
+            // 2) 集合与顺序参考完全一致：不漏（a 在 w3 的恢复等）、不重
+            assertEquals(expected, actual, "run=" + run + " 判定结果必须与顺序参考一致");
+            // 3) 重复 tick 不产生任何额外事件
+            for (int i = 0; i < 3; i++) {
+                clock.advanceMs(1_000);
+                service.maintain();
+            }
+            assertTrue(service.drainGroupAlertEvents().isEmpty(),
+                    "重复滚动不得重复判定，run=" + run);
+        }
+        log.info("[分组并发-恰好一次] {} 轮并发滚动全部得到与顺序参考一致的 5 个翻转事件", runs);
     }
 
     @Test

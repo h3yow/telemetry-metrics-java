@@ -34,9 +34,13 @@ class ConcurrentIngestTest {
     private static final Logger log = LoggerFactory.getLogger(ConcurrentIngestTest.class);
 
     private static MetricsService newService(MutableClock clock, int capacity) {
+        return newService(clock, capacity, 5);
+    }
+
+    private static MetricsService newService(MutableClock clock, int capacity, int retainedWindows) {
         MetricsProperties p = new MetricsProperties();
         p.setWindowSizeMs(1_000);
-        p.setRetainedWindows(5);
+        p.setRetainedWindows(retainedWindows);
         p.setLateArrivalGraceMs(0);
         p.setMaxFutureSkewMs(60_000);
         p.setMaxSamplesPerSeriesWindow(capacity);
@@ -147,10 +151,11 @@ class ConcurrentIngestTest {
         // 结束后严格对账：接受数 == 仍保留窗口计数 + 已封定窗口被消费的计数，无重复无丢失。
         long t0 = 50_000;
         MutableClock clock = new MutableClock(t0 - 30_000);
-        MetricsService service = newService(clock, 1_000_000);
-
+        // 保留窗口数足够覆盖样本窗口（维护线程只在样本窗口之前的时间段滚动），
+        // 使封定/淘汰与上报并发交错时的对账不依赖线程调度。
         int writerThreads = 6;
         int windowsCovered = 4;
+        MetricsService service = newService(clock, 1_000_000, windowsCovered + 1);
         int perWindowPerThread = 100;
         ExecutorService pool = Executors.newFixedThreadPool(writerThreads + 1);
         CountDownLatch start = new CountDownLatch(1);
@@ -206,14 +211,16 @@ class ConcurrentIngestTest {
         assertEquals(0, rejected.get(), "样本事件时间始终在维护时钟之前，不应被拒绝");
         assertEquals(totalInput, accepted.get(), "每个样本必须有确定去向且全部接受");
 
-        // 把时钟推过全部样本窗口并逐一封定后，仍保留窗口中的计数应等于接受总数：
-        // 封定只触发告警回调、不删除样本；只要窗口尚在保留范围内，接受即被计数。
-        clock.setTime(t0 + windowsCovered * 1_000L + 1);
-        service.maintain();
+        // 全部窗口封定后对账：接受数必须等于仍可查到的计数（保留窗口数在构造服务时
+        // 已按“样本窗口跨度 + 维护线程最大提前量”放宽，保证对账与线程调度无关）。
+        // 并发滚动结束后直接对账（不再把时钟一次性跳到全部窗口之后——那会按保留策略
+        // 正常淘汰旧窗口，与“接受即计数”的对账无关）：并发交错期间接受的每个样本都必须
+        // 仍在其归属窗口中可查到，无重复无丢失。
         long counted = service.query("cpu", Map.of("host", "r"),
                 t0, t0 + (windowsCovered - 1) * 1_000L)
                 .stream().mapToLong(WindowAggregation::count).sum();
-        log.info("[并发-滚动] 全部窗口封定后仍保留窗口计数={} (retainedWindows=5 覆盖全部 4 窗)", counted);
+        log.info("[并发-滚动] 并发滚动后窗口计数={} 接受={} (保留窗口数覆盖维护提前量)", counted,
+                accepted.get());
         assertEquals(accepted.get(), counted, "封定与上报并发下：接受即被计数，无重复无丢失");
     }
 

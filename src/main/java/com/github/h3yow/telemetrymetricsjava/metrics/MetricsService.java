@@ -67,7 +67,14 @@ public class MetricsService {
 
             @Override
             public void onWindowBatchSealed(long windowStart, List<WindowAggregation> aggregations) {
-                groupAlertEvaluator.evaluateWindow(windowStart, aggregations);
+                // 存储层保证周期严格按窗口升序投递；水位在同周期末尾统一通知，
+                // 这里先按窗口自身水位暂存/应用，乱序防御在判定器内完成。
+                groupAlertEvaluator.evaluateWindow(windowStart, aggregations, windowStart);
+            }
+
+            @Override
+            public void onSealHorizonAdvanced(long sealHorizonWindowStart) {
+                groupAlertEvaluator.advanceSealWatermark(sealHorizonWindowStart);
             }
         });
     }

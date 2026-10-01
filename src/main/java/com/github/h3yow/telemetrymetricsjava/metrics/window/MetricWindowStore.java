@@ -28,11 +28,19 @@ import java.util.concurrent.locks.ReentrantLock;
  * 重复计数与样本丢失；查询在同一把锁下取不可变快照，随后锁外组装结果，
  * 查询延迟只与命中的窗口数（有界）有关。</p>
  *
- * <p><b>内存上界</b>：任一时刻存活窗口数至多为
+ * <p><b>封定投递顺序</b>：每个封定临界区在锁内领取单调票号，锁外的批量回调由独立的
+ * “投递闸门”按票号严格升序执行——后封定出窗口的线程即使先走到回调处也必须等待，
+ * 因此跨线程的封定批次严格按窗口起点升序到达告警侧，较晚窗口不可能先于较早窗口被
+ * 判定；每个周期末尾还按序通知一次“封定上界水位”，缺样本窗口造成的缺口也能即时告知。
+ * 淘汰严格不越过最近封定窗口（宽限大于保留跨度时由封定点兜底），任何窗口都先完成
+ * 恰好一次的封定投递、再被回收，不会被整段漏判。</p>
+ *
+ * <p><b>内存上界</b>：常规配置（迟到宽限 ≤ 保留跨度）下任一时刻存活窗口数至多为
  * {@code retainedWindows + futureToleranceWindows}（时间在走，维护会持续淘汰）；
  * 序列数 ≤ maxSeries；单序列单窗口样本数 ≤ maxSamplesPerSeriesWindow；
  * 标签值基数 ≤ maxLabelValuesPerKey；幂等集合大小 ≤ 样本条数。总占用有明确上界：
- * {@code O(maxSeries × 窗口数 × 单窗口样本容量)}。</p>
+ * {@code O(maxSeries × 窗口数 × 单窗口样本容量)}。迟到宽限大于保留跨度时存活窗口数
+ * 随宽限放大（为保证不漏判的显式取舍），仍受 maxSeries 等其余上界约束。</p>
  */
 public class MetricWindowStore {
 
@@ -45,6 +53,19 @@ public class MetricWindowStore {
     private final long lateArrivalGraceMs;
     private final Clock clock;
     private final ReentrantLock lock = new ReentrantLock();
+
+    /**
+     * 批量封定回调的“投递闸门”：封定在 {@link #lock} 内按临界区先后拿到单调票号，
+     * 回调在锁外必须严格按票号顺序投递，保证不同线程封定的窗口也严格按窗口起点
+     * 升序到达分组判定器（较晚窗口不可能先于较早窗口被处理）。
+     */
+    private final ReentrantLock dispatchGate = new ReentrantLock(true);
+    private final java.util.concurrent.locks.Condition dispatchTurn =
+            dispatchGate.newCondition();
+    private long dispatchTicketSeq;
+    private long nextDispatchTicket;
+    /** 已通过投递闸门通知给监听方的封定上界（只在存储锁内读写）。 */
+    private long lastNotifiedSealHorizon = Long.MIN_VALUE;
 
     /** seriesKey -> (windowStart -> 窗口累加器)。内层 TreeMap 便于按窗口淘汰与范围查询。 */
     private final Map<SeriesKey, TreeMap<Long, SeriesWindow>> series = new HashMap<>();
@@ -109,9 +130,18 @@ public class MetricWindowStore {
 
         lock.lock();
         NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
+        long dispatchTicket = -1L;
+        long sealHorizon = Long.MIN_VALUE;
         try {
             // 维护先行：保证存活窗口集合始终是有界的。
-            maintainWindowsLocked(now, sealedBatches);
+            long cycleHorizon = maintainWindowsLocked(now, sealedBatches);
+            // 票号在存储锁内按封定临界区顺序分配；拿到票的周期随后严格按票升序投递。
+            // 即使本周期没有批次也要占票：水位通知同样必须按封定周期顺序到达判定器。
+            if (cycleHorizon > lastNotifiedSealHorizon) {
+                dispatchTicket = dispatchTicketSeq++;
+                sealHorizon = cycleHorizon;
+                lastNotifiedSealHorizon = cycleHorizon;
+            }
 
             long cutoff = now - lateArrivalGraceMs;
             if (ts < cutoff) {
@@ -174,7 +204,9 @@ public class MetricWindowStore {
                             + "), count=" + w.count());
         } finally {
             lock.unlock();
-            dispatchBatches(sealedBatches);
+            if (dispatchTicket >= 0) {
+                dispatchCycleInOrder(dispatchTicket, sealHorizon, sealedBatches);
+            }
         }
     }
 
@@ -184,28 +216,72 @@ public class MetricWindowStore {
      */
     public void maintain() {
         NavigableMap<Long, List<WindowAggregation>> sealedBatches = new TreeMap<>();
+        long dispatchTicket = -1L;
+        long sealHorizon = Long.MIN_VALUE;
         lock.lock();
         try {
-            maintainWindowsLocked(clock.millis(), sealedBatches);
+            long cycleHorizon = maintainWindowsLocked(clock.millis(), sealedBatches);
+            if (cycleHorizon > lastNotifiedSealHorizon) {
+                dispatchTicket = dispatchTicketSeq++;
+                sealHorizon = cycleHorizon;
+                lastNotifiedSealHorizon = cycleHorizon;
+            }
         } finally {
             lock.unlock();
-            dispatchBatches(sealedBatches);
+        }
+        if (dispatchTicket >= 0) {
+            dispatchCycleInOrder(dispatchTicket, sealHorizon, sealedBatches);
         }
     }
 
-    /** 批量封定回调在锁外触发（聚合计算可能较重），但“每窗口一次”的保证在锁内已确立。 */
-    private void dispatchBatches(NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
-        for (Map.Entry<Long, List<WindowAggregation>> e : sealedBatches.entrySet()) {
-            sealedWindowListener.onWindowBatchSealed(e.getKey(), e.getValue());
+    /**
+     * 按票号严格升序投递一个封定周期：先投递本周期封定的全部批次（内部已按窗口起点
+     * 升序），最后通知封定上界水位。后完成封定的线程即使先走到这里也必须等待，
+     * 从源头杜绝“较晚窗口先判定、较早窗口被跳过”，并让缺样本窗口的缺口能及时告知判定器。
+     */
+    private void dispatchCycleInOrder(long ticket, long sealHorizon,
+                                      NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
+        dispatchGate.lock();
+        try {
+            while (ticket != nextDispatchTicket) {
+                dispatchTurn.awaitUninterruptibly();
+            }
+            try {
+                for (Map.Entry<Long, List<WindowAggregation>> e : sealedBatches.entrySet()) {
+                    sealedWindowListener.onWindowBatchSealed(e.getKey(), e.getValue());
+                }
+                sealedWindowListener.onSealHorizonAdvanced(sealHorizon);
+            } finally {
+                nextDispatchTicket++;
+                dispatchTurn.signalAll();
+            }
+        } finally {
+            dispatchGate.unlock();
         }
     }
 
-    private void maintainWindowsLocked(long now,
+    /**
+     * 在存储锁内执行封定与淘汰，并返回本周期的封定上界窗口起点
+     * （所有起点 ≤ 该值且有样本的窗口本轮都已封定）。
+     */
+    private long maintainWindowsLocked(long now,
                                        NavigableMap<Long, List<WindowAggregation>> sealedBatches) {
         // 窗口 [s, s+size) 封定条件：s + size + grace <= now，故封定上界为
         // floor((now - grace - size) / size) * size。grace=0 时恰好在下一个窗口开始时封定。
         long sealHorizon = floorWindowStart(now - lateArrivalGraceMs - windowSizeMs);
-        long oldestAllowed = floorWindowStart(now) - (long) (retainedWindows - 1) * windowSizeMs;
+        long retentionCutoff =
+                floorWindowStart(now) - (long) (retainedWindows - 1) * windowSizeMs;
+        // 淘汰点（headMap(cutoff, false) 删起点严格小于 cutoff 的窗口）。
+        // 任何被淘汰的窗口都必须是“已经封定且批次已投递”的：起点严格小于 sealHorizon
+        // 的窗口在更早周期就已封定投递，可安全回收；sealHorizon（本轮最近封定窗口）
+        // 的批次在本轮锁释放后才投递，本轮必须保留，因此淘汰点必须 ≤ sealHorizon。
+        //  - 常规（生产默认，宽限 ≤ 保留跨度）：保留期下界 ≤ sealHorizon，取保留期下界，
+        //    存活窗口数严格受 retainedWindows 约束；
+        //  - 宽限 > 保留跨度时：保留期下界 > sealHorizon（按它淘汰会删掉尚未判定的窗口），
+        //    退化为 sealHorizon，只回收严格更早、必然已投递完的窗口。任何窗口都先封定、
+        //    快照恰好交付一次之后才回收，杜绝漏判（此配置下存活窗口数随宽限放大，
+        //    是明确的容量取舍）。
+        long effectiveEvictCutoff = Math.min(retentionCutoff, sealHorizon);
 
         // 本趟新封定的快照按 windowStart 收集；同一窗口来自所有序列的快照组成一个
         // 稳定有序批次（锁外按序列键排序），交给分组告警做跨序列聚合。
@@ -228,8 +304,9 @@ public class MetricWindowStore {
                 }
             }
 
-            // 2) 淘汰：早于保留下界的窗口直接移除（聚合已在封定时被告警侧消费）。
-            windows.headMap(oldestAllowed, false).clear();
+            // 2) 淘汰：早于有效淘汰点的窗口直接移除（聚合已在封定时被告警侧消费）。
+            //    淘汰点保证所有被删窗口都已完成封定且批次已收集，判定一个窗口都不会漏。
+            windows.headMap(effectiveEvictCutoff, false).clear();
             if (windows.isEmpty()) {
                 it.remove();
             }
@@ -240,6 +317,7 @@ public class MetricWindowStore {
             batch.sort(java.util.Comparator.comparing(
                     a -> SeriesKey.of(a.name(), a.labels()).render()));
         }
+        return sealHorizon;
     }
 
     /**

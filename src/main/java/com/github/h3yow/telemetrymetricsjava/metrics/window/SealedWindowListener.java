@@ -30,4 +30,14 @@ public interface SealedWindowListener {
      */
     default void onWindowBatchSealed(long windowStart, List<WindowAggregation> aggregations) {
     }
+
+    /**
+     * 一次封定周期完成通知：本轮封定上界为 {@code sealHorizonWindowStart}
+     * （所有起点 ≤ 该上界、且确有样本的窗口都已通过 {@link #onWindowBatchSealed}
+     * 送达）。即使本轮没有任何有样本窗口被封定，本回调也会触发一次，
+     * 用来告知消费侧“未送达的更老窗口只是缺样本窗口，不会再来了”，
+     * 以便乱序在途的窗口批次可以安全地按序补刷。默认空实现。
+     */
+    default void onSealHorizonAdvanced(long sealHorizonWindowStart) {
+    }
 }
